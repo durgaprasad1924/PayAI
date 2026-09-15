@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: payai-postgres
+    environment:
+      POSTGRES_USER: payai
+      POSTGRES_PASSWORD: payai_password
+      POSTGRES_DB: payai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
