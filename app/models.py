@@ -30,6 +30,7 @@ class Transfer(Base):
     receiver_wallet_id = Column(Integer,ForeignKey("wallets.id"),nullable=False)
     amount = Column(Numeric(12, 2),nullable=False)
     status = Column(String(20),nullable=False,default="COMPLETED")
+    idempotency_key = Column(String(100),unique=True,nullable=False)
 
 
 class WalletTransaction(Base):

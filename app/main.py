@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 from decimal import Decimal
 from sqlalchemy.exc import IntegrityError
@@ -315,12 +315,15 @@ def get_wallet_transactions(wallet_id: int):
     finally:
         db.close()
 
-
 @app.post("/transfers")
-def create_transfer(transfer_request: TransferRequest):
+def create_transfer(
+    transfer_request: TransferRequest,
+    idempotency_key: str = Header(...)
+):
     db = SessionLocal()
 
     try:
+
         # 1. Sender and receiver cannot be the same user
         if transfer_request.sender_user_id == transfer_request.receiver_user_id:
             raise HTTPException(
@@ -346,7 +349,53 @@ def create_transfer(transfer_request: TransferRequest):
                 detail="Receiver user not found"
             )
 
-        # 4. Get both wallets in a consistent order
+        # 4. Check whether this idempotency key was already processed
+        existing_transfer = (
+            db.query(Transfer)
+            .filter(Transfer.idempotency_key == idempotency_key)
+            .first()
+        )
+
+        if existing_transfer is not None:
+
+            # Find wallets belonging to the original transfer
+            if (
+                existing_transfer.sender_wallet_id
+                != db.get(Wallet, existing_transfer.sender_wallet_id).id
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid existing transfer"
+                )
+
+            original_sender_wallet = db.get(
+                Wallet,
+                existing_transfer.sender_wallet_id
+            )
+
+            original_receiver_wallet = db.get(
+                Wallet,
+                existing_transfer.receiver_wallet_id
+            )
+
+            if (
+                original_sender_wallet.user_id != sender.id
+                or original_receiver_wallet.user_id != receiver.id
+                or existing_transfer.amount != transfer_request.amount
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Idempotency key already used with different payment details"
+                )
+
+            return {
+                "transfer_id": existing_transfer.id,
+                "amount": float(existing_transfer.amount),
+                "status": existing_transfer.status,
+                "message": "Transfer already processed"
+            }
+
+        # 5. Get both wallets in a consistent order
         wallet_user_ids = sorted([
             sender.id,
             receiver.id
@@ -360,13 +409,14 @@ def create_transfer(transfer_request: TransferRequest):
             .all()
         )
 
-        # 5. Make sure both wallets exist
+        # 6. Make sure both wallets exist
         if len(wallets) != 2:
             raise HTTPException(
                 status_code=404,
                 detail="Sender or receiver wallet not found"
             )
-        # 6. Identify sender and receiver wallet
+
+        # 7. Identify sender and receiver wallet
         if wallets[0].user_id == sender.id:
             sender_wallet = wallets[0]
             receiver_wallet = wallets[1]
@@ -374,29 +424,30 @@ def create_transfer(transfer_request: TransferRequest):
             sender_wallet = wallets[1]
             receiver_wallet = wallets[0]
 
-        # 7. Check sender balance
+        # 8. Check sender balance
         if sender_wallet.balance < transfer_request.amount:
             raise HTTPException(
                 status_code=400,
                 detail="Insufficient wallet balance"
             )
 
-        # 8. Deduct from sender
+        # 9. Deduct from sender
         sender_wallet.balance = (
             sender_wallet.balance - transfer_request.amount
         )
 
-        # 9. Add to receiver
+        # 10. Add to receiver
         receiver_wallet.balance = (
             receiver_wallet.balance + transfer_request.amount
         )
 
-        # 10. Create transfer record
+        # 11. Create transfer record
         transfer = Transfer(
             sender_wallet_id=sender_wallet.id,
             receiver_wallet_id=receiver_wallet.id,
             amount=transfer_request.amount,
-            status="COMPLETED"
+            status="COMPLETED",
+            idempotency_key=idempotency_key
         )
 
         db.add(transfer)
@@ -404,7 +455,7 @@ def create_transfer(transfer_request: TransferRequest):
         # Generate transfer ID before creating ledger records
         db.flush()
 
-        # 11. Sender ledger
+        # 12. Sender ledger
         sender_transaction = WalletTransaction(
             wallet_id=sender_wallet.id,
             transfer_id=transfer.id,
@@ -413,7 +464,7 @@ def create_transfer(transfer_request: TransferRequest):
             amount=transfer_request.amount
         )
 
-        # 12. Receiver ledger
+        # 13. Receiver ledger
         receiver_transaction = WalletTransaction(
             wallet_id=receiver_wallet.id,
             transfer_id=transfer.id,
@@ -425,7 +476,7 @@ def create_transfer(transfer_request: TransferRequest):
         db.add(sender_transaction)
         db.add(receiver_transaction)
 
-        # 13. Commit everything atomically
+        # 14. Commit everything atomically
         db.commit()
 
         db.refresh(transfer)
@@ -441,6 +492,28 @@ def create_transfer(transfer_request: TransferRequest):
             "sender_balance": float(sender_wallet.balance),
             "receiver_balance": float(receiver_wallet.balance)
         }
+
+    except IntegrityError:
+
+        # Another concurrent request may have created
+        # this idempotency key first.
+        db.rollback()
+
+        existing_transfer = (
+            db.query(Transfer)
+            .filter(Transfer.idempotency_key == idempotency_key)
+            .first()
+        )
+
+        if existing_transfer is not None:
+            return {
+                "transfer_id": existing_transfer.id,
+                "amount": float(existing_transfer.amount),
+                "status": existing_transfer.status,
+                "message": "Transfer already processed"
+            }
+
+        raise
 
     except HTTPException:
         db.rollback()
