@@ -4,7 +4,9 @@ from decimal import Decimal
 from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
-from app.models import User, Wallet, WalletTransaction, Transfer
+from app.models import User, Wallet, WalletTransaction, Transfer, DateTime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 app = FastAPI(title="PayAI")
 
@@ -287,6 +289,7 @@ def get_wallet_transactions(wallet_id: int):
     db = SessionLocal()
 
     try:
+        # 1. Check wallet exists
         wallet = db.get(Wallet, wallet_id)
 
         if wallet is None:
@@ -295,22 +298,104 @@ def get_wallet_transactions(wallet_id: int):
                 detail="Wallet not found"
             )
 
+        # 2. Get transactions for this wallet
         transactions = (
             db.query(WalletTransaction)
-            .filter(WalletTransaction.wallet_id == wallet_id)
-            .order_by(WalletTransaction.id)
+            .filter(
+                WalletTransaction.wallet_id == wallet_id
+            )
+            .order_by(
+                WalletTransaction.created_at.desc(),
+                WalletTransaction.id.desc()
+            )
             .all()
         )
 
-        return [
-            {
-                "id": transaction.id,
-                "wallet_id": transaction.wallet_id,
+        result = []
+
+        for transaction in transactions:
+
+            created_at_ist = transaction.created_at.astimezone(
+                ZoneInfo("Asia/Kolkata")
+            )
+
+            item = {
+                "transaction_id": transaction.id,
                 "transaction_type": transaction.transaction_type,
-                "amount": float(transaction.amount)
+                "amount": float(transaction.amount),
+                "created_at": created_at_ist.isoformat()
             }
-            for transaction in transactions
-        ]
+
+            if transaction.transaction_type == "DEPOSIT":
+                item["direction"] = "CREDIT"
+                item["description"] = "Money added to wallet"
+
+            elif transaction.transaction_type == "WITHDRAWAL":
+                item["direction"] = "DEBIT"
+                item["description"] = "Money withdrawn from wallet"
+
+            # 3. Add P2P transfer information
+            elif transaction.transaction_type == "TRANSFER":
+
+                transfer = db.get(
+                    Transfer,
+                    transaction.transfer_id
+                )
+
+                if transfer is not None:
+
+                    item["transfer_id"] = transfer.id
+                    item["transaction_role"] = (
+                        transaction.transaction_role
+                    )
+                    item["status"] = transfer.status
+
+                    # Find the other wallet
+                    if transaction.wallet_id == transfer.sender_wallet_id:
+                        counterparty_wallet_id = (
+                            transfer.receiver_wallet_id
+                        )
+                    else:
+                        counterparty_wallet_id = (
+                            transfer.sender_wallet_id
+                        )
+
+                    # Find counterparty wallet
+                    counterparty_wallet = db.get(
+                        Wallet,
+                        counterparty_wallet_id
+                    )
+
+                    if counterparty_wallet is not None:
+
+                        # Find counterparty user
+                        counterparty_user = db.get(
+                            User,
+                            counterparty_wallet.user_id
+                        )
+
+                        if counterparty_user is not None:
+                            item["counterparty_user_id"] = (
+                                counterparty_user.id
+                            )
+                            item["counterparty_name"] = (
+                                counterparty_user.name
+                            )
+
+                            if transaction.transaction_role == "SENDER":
+                                item["direction"] = "DEBIT"
+                                item["description"] = (
+                                    f"Sent to {counterparty_user.name}"
+                                )
+                            else:
+                                item["direction"] = "CREDIT"
+                                item["description"] = (
+                                    f"Received from {counterparty_user.name}"
+                                )
+
+            result.append(item)
+
+        return result
 
     finally:
         db.close()

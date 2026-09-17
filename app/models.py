@@ -1,6 +1,6 @@
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import Column, Integer, String, Numeric, ForeignKey
-
+from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, DateTime
+from datetime import datetime, timezone
 
 class Base(DeclarativeBase):
     pass
@@ -42,4 +42,5 @@ class WalletTransaction(Base):
     transaction_type = Column(String(20),nullable=False)
     transaction_role = Column(String(20),nullable=True)
     amount = Column(Numeric(12, 2),nullable=False)
+    created_at = Column(DateTime(timezone=True),nullable=False,default=lambda: datetime.now(timezone.utc))
 
