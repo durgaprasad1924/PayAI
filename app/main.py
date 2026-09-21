@@ -4,9 +4,11 @@ from decimal import Decimal
 from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
-from app.models import User, Wallet, WalletTransaction, Transfer, DateTime
-from datetime import datetime
+from app.models import User, Wallet, WalletTransaction, Transfer, DateTime, OTPVerification
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from app.schemas.auth import OTPRequest, OTPVerifyRequest
+from app.services.otp_service import generate_otp, hash_otp, verify_otp
 
 app = FastAPI(title="PayAI")
 
@@ -607,6 +609,120 @@ def create_transfer(
     except Exception:
         db.rollback()
         raise
+
+    finally:
+        db.close()
+
+@app.post("/auth/request-otp")
+def request_otp(request: OTPRequest):
+    db = SessionLocal()
+
+    try:
+        otp = generate_otp()
+        otp_hash = hash_otp(otp)
+
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+
+        otp_record = OTPVerification(
+            identifier=request.identifier,
+            channel=request.channel,
+            purpose=request.purpose,
+            otp_hash=otp_hash,
+            expires_at=expires_at
+        )
+
+        db.add(otp_record)
+        db.commit()
+        db.refresh(otp_record)
+
+        return {
+            "message": "OTP generated successfully",
+            "otp": otp,
+            "expires_at": expires_at.isoformat()
+        }
+
+    finally:
+        db.close()
+
+@app.post("/auth/verify-otp")
+def verify_otp_endpoint(request: OTPVerifyRequest):
+    db = SessionLocal()
+
+    try:
+        otp_record = (
+            db.query(OTPVerification)
+            .filter(
+                OTPVerification.identifier == request.identifier,
+                OTPVerification.channel == request.channel,
+                OTPVerification.purpose == request.purpose,
+                OTPVerification.used_at.is_(None)
+            )
+            .order_by(OTPVerification.created_at.desc())
+            .first()
+        )
+
+        if not otp_record:
+            return {
+                "message": "Invalid or expired OTP"
+            }
+
+        now = datetime.now(timezone.utc)
+
+        if otp_record.expires_at <= now:
+            return {
+                "message": "OTP has expired"
+            }
+
+        if otp_record.attempts >= 5:
+            return {
+                "message": "Too many invalid attempts"
+            }
+
+        is_valid = verify_otp(
+            request.otp,
+            otp_record.otp_hash
+        )
+
+        if not is_valid:
+            otp_record.attempts += 1
+            db.commit()
+
+            return {
+                "message": "Invalid OTP",
+                "attempts_remaining": 5 - otp_record.attempts
+            }
+
+        otp_record.used_at = now
+
+        if request.purpose == "PHONE_VERIFICATION":
+            user = (
+                db.query(User)
+                .filter(User.phone == request.identifier)
+                .first()
+            )
+
+            if user:
+                user.phone_verified = True
+
+        elif request.purpose == "EMAIL_VERIFICATION":
+            user = (
+                db.query(User)
+                .filter(User.email == request.identifier)
+                .first()
+        )
+
+        if user:
+            user.email_verified = True
+
+
+        if user:
+            user.phone_verified = True
+
+        db.commit()
+
+        return {
+            "message": "OTP verified successfully"
+        }
 
     finally:
         db.close()
