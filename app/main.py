@@ -4,11 +4,12 @@ from decimal import Decimal
 from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
-from app.models import User, Wallet, WalletTransaction, Transfer, DateTime, OTPVerification
+from app.models import RegistrationChallenge, User, OTPVerification, Wallet, WalletTransaction, Transfer, DateTime
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from app.schemas.auth import OTPRequest, OTPVerifyRequest
+from app.schemas.auth import OTPRequest, OTPVerifyRequest, RegistrationStartRequest, RegistrationPhoneVerifyRequest, RegistrationDetailsRequest, RegistrationEmailVerifyRequest
 from app.services.otp_service import generate_otp, hash_otp, verify_otp
+from app.services.registration_service import generate_registration_token
 
 app = FastAPI(title="PayAI")
 
@@ -722,6 +723,389 @@ def verify_otp_endpoint(request: OTPVerifyRequest):
 
         return {
             "message": "OTP verified successfully"
+        }
+
+    finally:
+        db.close()
+
+
+@app.post("/auth/register/start")
+def start_registration(request: RegistrationStartRequest):
+    db = SessionLocal()
+
+    try:
+        existing_user = (
+            db.query(User)
+            .filter(User.phone == request.phone)
+            .first()
+        )
+
+        if existing_user:
+            return {
+                "message": "Phone number is already registered"
+            }
+
+        now = datetime.now(timezone.utc)
+
+        registration = (
+            db.query(RegistrationChallenge)
+            .filter(
+                RegistrationChallenge.phone == request.phone,
+                RegistrationChallenge.status == "IN_PROGRESS"
+            )
+            .order_by(RegistrationChallenge.created_at.desc())
+            .first()
+        )
+
+        if registration and registration.expires_at <= now:
+            registration.status = "EXPIRED"
+            registration = None
+
+        if not registration:
+            registration = RegistrationChallenge(
+                registration_token=generate_registration_token(),
+                phone=request.phone,
+                expires_at=now + timedelta(minutes=15)
+            )
+
+            db.add(registration)
+            db.flush()
+
+        otp = generate_otp()
+        otp_hash = hash_otp(otp)
+
+        otp_record = OTPVerification(
+            identifier=request.phone,
+            channel="PHONE",
+            purpose="PHONE_REGISTRATION",
+            otp_hash=otp_hash,
+            expires_at=now + timedelta(minutes=5)
+        )
+
+        db.add(otp_record)
+        db.commit()
+        db.refresh(registration)
+
+        return {
+            "message": "Registration started",
+            "registration_token": registration.registration_token,
+            "otp": otp,
+            "expires_at": registration.expires_at.isoformat()
+        }
+
+    finally:
+        db.close()
+
+
+@app.post("/auth/register/verify-phone")
+def verify_registration_phone(
+    request: RegistrationPhoneVerifyRequest
+): 
+
+    db = SessionLocal()
+
+    try:
+        registration = (
+            db.query(RegistrationChallenge)
+            .filter(
+                RegistrationChallenge.registration_token == request.registration_token
+            )
+            .first()
+        )
+
+        if not registration:
+            return {
+                "message": "Registration not found"
+            }
+
+        now = datetime.now(timezone.utc)
+
+        if registration.status != "IN_PROGRESS":
+            return {
+                "message": "Registration is no longer active"
+            }
+
+        if registration.expires_at <= now:
+            registration.status = "EXPIRED"
+            db.commit()
+
+            return {
+                "message": "Registration has expired"
+            }
+
+        if registration.phone_verified:
+            return {
+                "message": "Phone number is already verified"
+            }
+
+        otp_record = (
+            db.query(OTPVerification)
+            .filter(
+                OTPVerification.identifier == registration.phone,
+                OTPVerification.channel == "PHONE",
+                OTPVerification.purpose == "PHONE_REGISTRATION",
+                OTPVerification.used_at.is_(None)
+            )
+            .order_by(OTPVerification.created_at.desc())
+            .first()
+        )
+
+        if not otp_record:
+            return {
+                "message": "OTP not found"
+            }
+
+        if otp_record.expires_at <= now:
+            return {
+                "message": "OTP has expired"
+            }
+
+        if otp_record.attempts >= 5:
+            return {
+                "message": "Too many invalid attempts"
+            }
+
+        is_valid = verify_otp(
+            request.otp,
+            otp_record.otp_hash
+        )
+
+        if not is_valid:
+            otp_record.attempts += 1
+            db.commit()
+
+            return {
+                "message": "Invalid OTP",
+                "attempts_remaining": 5 - otp_record.attempts
+            }
+
+        otp_record.used_at = now
+        registration.phone_verified = True
+
+        db.commit()
+
+        return {
+            "message": "Phone number verified successfully",
+            "registration_id": registration.id
+        }
+
+    finally:
+        db.close()
+
+
+@app.post("/auth/register/details")
+def register_details(request: RegistrationDetailsRequest):
+    db = SessionLocal()
+
+    try:
+        now = datetime.now(timezone.utc)
+
+        registration = (
+            db.query(RegistrationChallenge)
+            .filter(
+                RegistrationChallenge.registration_token
+                == request.registration_token
+            )
+            .first()
+        )
+
+        if not registration:
+            raise HTTPException(
+                status_code=404,
+                detail="Registration session not found"
+            )
+
+        if registration.status != "IN_PROGRESS":
+            raise HTTPException(
+                status_code=400,
+                detail="Registration session is no longer active"
+            )
+
+        if registration.expires_at <= now:
+            registration.status = "EXPIRED"
+            db.commit()
+
+            raise HTTPException(
+                status_code=400,
+                detail="Registration session has expired"
+            )
+
+        if not registration.phone_verified:
+            raise HTTPException(
+                status_code=400,
+                detail="Phone number must be verified first"
+            )
+
+        existing_user = (
+            db.query(User)
+            .filter(User.email == request.email)
+            .first()
+        )
+
+        if existing_user:
+            raise HTTPException(
+                status_code=409,
+                detail="Email address is already registered"
+            )
+
+        registration.name = request.name
+        registration.email = request.email
+
+        otp = generate_otp()
+        otp_hash = hash_otp(otp)
+
+        otp_record = OTPVerification(
+            identifier=request.email,
+            channel="EMAIL",
+            purpose="EMAIL_REGISTRATION",
+            otp_hash=otp_hash,
+            expires_at=now + timedelta(minutes=5)
+        )
+
+        db.add(otp_record)
+        db.commit()
+
+        return {
+            "message": "Registration details saved. Email OTP generated.",
+            "otp": otp,
+            "expires_at": otp_record.expires_at.isoformat()
+        }
+
+    finally:
+        db.close()
+
+@app.post("/auth/register/verify-email")
+def verify_registration_email(
+    request: RegistrationEmailVerifyRequest
+):
+    db = SessionLocal()
+
+    try:
+        now = datetime.now(timezone.utc)
+
+        registration = (
+            db.query(RegistrationChallenge)
+            .filter(
+                RegistrationChallenge.registration_token
+                == request.registration_token
+            )
+            .first()
+        )
+
+        if not registration:
+            raise HTTPException(
+                status_code=404,
+                detail="Registration session not found"
+            )
+
+        if registration.status != "IN_PROGRESS":
+            raise HTTPException(
+                status_code=400,
+                detail="Registration session is no longer active"
+            )
+
+        if registration.expires_at <= now:
+            registration.status = "EXPIRED"
+            db.commit()
+
+            raise HTTPException(
+                status_code=400,
+                detail="Registration session has expired"
+            )
+
+        if not registration.phone_verified:
+            raise HTTPException(
+                status_code=400,
+                detail="Phone number must be verified first"
+            )
+
+        if not registration.email:
+            raise HTTPException(
+                status_code=400,
+                detail="Email address has not been provided"
+            )
+
+        if registration.email_verified:
+            raise HTTPException(
+                status_code=400,
+                detail="Email address is already verified"
+            )
+
+        otp_record = (
+            db.query(OTPVerification)
+            .filter(
+                OTPVerification.identifier == registration.email,
+                OTPVerification.channel == "EMAIL",
+                OTPVerification.purpose == "EMAIL_REGISTRATION",
+                OTPVerification.used_at.is_(None),
+            )
+            .order_by(OTPVerification.created_at.desc())
+            .first()
+        )
+
+        if not otp_record:
+            raise HTTPException(
+                status_code=400,
+                detail="No active email OTP found"
+            )
+
+        if otp_record.expires_at <= now:
+            raise HTTPException(
+                status_code=400,
+                detail="Email OTP has expired"
+            )
+
+        if otp_record.attempts >= 5:
+            raise HTTPException(
+                status_code=400,
+                detail="Maximum OTP attempts exceeded"
+            )
+
+        if not verify_otp(request.otp, otp_record.otp_hash):
+            otp_record.attempts += 1
+            db.commit()
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid OTP"
+            )
+
+        existing_user = (
+            db.query(User)
+            .filter(
+                (User.email == registration.email)
+                | (User.phone == registration.phone)
+            )
+            .first()
+        )
+
+        if existing_user:
+            raise HTTPException(
+                status_code=409,
+                detail="User already exists with this email or phone"
+            )
+
+        otp_record.used_at = now
+        registration.email_verified = True
+
+        user = User(
+            name=registration.name,
+            email=registration.email,
+            email_verified=True,
+            phone=registration.phone,
+            phone_verified=True,
+        )
+
+        db.add(user)
+
+        registration.status = "COMPLETED"
+
+        db.commit()
+        db.refresh(user)
+
+        return {
+            "message": "Registration completed successfully",
+            "user_id": user.id,
         }
 
     finally:

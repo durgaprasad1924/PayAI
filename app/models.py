@@ -65,6 +65,7 @@ class RegistrationChallenge(Base):
     __tablename__ = "registration_challenges"
 
     id = Column(Integer, primary_key=True)
+    registration_token = Column(String(255),unique=True,nullable=False)
     phone = Column(String(20),unique=True,nullable=False)
     phone_verified = Column(Boolean,nullable=False,default=False)
     name = Column(String(100),nullable=True)
