@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, Header
+import jwt
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from decimal import Decimal
 from sqlalchemy.exc import IntegrityError
@@ -7,10 +9,12 @@ from app.database import SessionLocal
 from app.models import RegistrationChallenge, User, OTPVerification, Wallet, WalletTransaction, Transfer, DateTime
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from app.schemas.auth import OTPRequest, OTPVerifyRequest, RegistrationStartRequest, RegistrationPhoneVerifyRequest, RegistrationDetailsRequest, RegistrationEmailVerifyRequest
+from app.schemas.auth import OTPRequest, OTPVerifyRequest, RegistrationStartRequest, RegistrationPhoneVerifyRequest, RegistrationDetailsRequest, RegistrationEmailVerifyRequest, LoginRequest, LoginVerifyRequest
 from app.services.otp_service import generate_otp, hash_otp, verify_otp
 from app.services.registration_service import generate_registration_token
+from app.services.auth_service import create_access_token, decode_access_token
 
+security = HTTPBearer()
 app = FastAPI(title="PayAI")
 
 
@@ -1110,3 +1114,249 @@ def verify_registration_email(
 
     finally:
         db.close()
+
+@app.post("/auth/login/request-otp")
+def request_login_otp(request: LoginRequest):
+    db = SessionLocal()
+
+    try:
+        if request.channel == "PHONE":
+            user = (
+                db.query(User)
+                .filter(User.phone == request.identifier)
+                .first()
+            )
+
+            if not user:
+                raise HTTPException(
+                    status_code=404,
+                    detail="User not found"
+                )
+
+            if not user.phone_verified:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Phone number is not verified"
+                )
+
+        elif request.channel == "EMAIL":
+            user = (
+                db.query(User)
+                .filter(User.email == request.identifier)
+                .first()
+            )
+
+            if not user:
+                raise HTTPException(
+                    status_code=404,
+                    detail="User not found"
+                )
+
+            if not user.email_verified:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Email address is not verified"
+                )
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported login channel"
+            )
+
+        now = datetime.now(timezone.utc)
+
+        otp = generate_otp()
+        otp_hash = hash_otp(otp)
+
+        otp_record = OTPVerification(
+            user_id=user.id,
+            identifier=request.identifier,
+            channel=request.channel,
+            purpose="LOGIN",
+            otp_hash=otp_hash,
+            expires_at=now + timedelta(minutes=5)
+        )
+
+        db.add(otp_record)
+        db.commit()
+
+        return {
+            "message": "Login OTP generated successfully",
+            "otp": otp,
+            "expires_at": otp_record.expires_at.isoformat()
+        }
+
+    finally:
+        db.close()
+
+@app.post("/auth/login/verify")
+def verify_login(request: LoginVerifyRequest):
+    db = SessionLocal()
+
+    try:
+        now = datetime.now(timezone.utc)
+
+        # Find the user
+        if request.channel == "PHONE":
+            user = (
+                db.query(User)
+                .filter(User.phone == request.identifier)
+                .first()
+            )
+
+            if not user:
+                raise HTTPException(
+                    status_code=404,
+                    detail="User not found"
+                )
+
+            if not user.phone_verified:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Phone number is not verified"
+                )
+
+        elif request.channel == "EMAIL":
+            user = (
+                db.query(User)
+                .filter(User.email == request.identifier)
+                .first()
+            )
+
+            if not user:
+                raise HTTPException(
+                    status_code=404,
+                    detail="User not found"
+                )
+
+            if not user.email_verified:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Email address is not verified"
+                )
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported login channel"
+            )
+
+        # Find latest unused login OTP
+        otp_record = (
+            db.query(OTPVerification)
+            .filter(
+                OTPVerification.user_id == user.id,
+                OTPVerification.identifier == request.identifier,
+                OTPVerification.channel == request.channel,
+                OTPVerification.purpose == "LOGIN",
+                OTPVerification.used_at.is_(None),
+            )
+            .order_by(OTPVerification.created_at.desc())
+            .first()
+        )
+
+        if not otp_record:
+            raise HTTPException(
+                status_code=400,
+                detail="No active login OTP found"
+            )
+
+        # Check expiry
+        if otp_record.expires_at <= now:
+            raise HTTPException(
+                status_code=400,
+                detail="Login OTP has expired"
+            )
+
+        # Maximum attempts
+        if otp_record.attempts >= 5:
+            raise HTTPException(
+                status_code=400,
+                detail="Maximum OTP attempts exceeded"
+            )
+
+        # Verify OTP
+        if not verify_otp(request.otp, otp_record.otp_hash):
+            otp_record.attempts += 1
+            db.commit()
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid OTP"
+            )
+
+        # Mark OTP as used
+        otp_record.used_at = now
+
+        # Generate JWT
+        access_token = create_access_token(user.id)
+
+        db.commit()
+
+        return {
+            "message": "Login successful",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": 1800
+        }
+
+    finally:
+        db.close()
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    db = SessionLocal()
+
+    try:
+        token = credentials.credentials
+
+        try:
+            payload = decode_access_token(token)
+        except jwt.InvalidTokenError:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired access token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        user_id = payload.get("sub")
+
+        if not user_id:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid access token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        user = (
+            db.query(User)
+            .filter(User.id == int(user_id))
+            .first()
+        )
+
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="User not found",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        return user
+
+    finally:
+        db.close()
+
+@app.get("/auth/me")
+def get_me(
+    current_user: User = Depends(get_current_user),
+):
+    return {
+        "id": current_user.id,
+        "name": current_user.name,
+        "email": current_user.email,
+        "phone": current_user.phone,
+        "email_verified": current_user.email_verified,
+        "phone_verified": current_user.phone_verified,
+    }

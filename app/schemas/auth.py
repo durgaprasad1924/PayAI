@@ -28,3 +28,12 @@ class RegistrationDetailsRequest(BaseModel):
 class RegistrationEmailVerifyRequest(BaseModel):
     registration_token: str
     otp: str
+
+class LoginRequest(BaseModel):
+    identifier: str
+    channel: str
+
+class LoginVerifyRequest(BaseModel):
+    identifier: str
+    channel: str
+    otp: str
