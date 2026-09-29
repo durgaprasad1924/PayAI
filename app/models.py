@@ -15,13 +15,14 @@ class User(Base):
     email_verified = Column(Boolean,nullable=False,default=False)
     phone = Column(String(20),unique=True,nullable=True)
     phone_verified = Column(Boolean,nullable=False,default=False)
+    mpin_hash = Column(String(255), nullable=True)
 
 class Wallet(Base):
     __tablename__ = "wallets"
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
-    balance = Column(Numeric(12, 2), nullable=False, default=0) 
+    balance = Column(Numeric(12, 2), nullable=False, default=0)
 
 
 class Transfer(Base):

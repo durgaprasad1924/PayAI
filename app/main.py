@@ -9,10 +9,11 @@ from app.database import SessionLocal
 from app.models import RegistrationChallenge, User, OTPVerification, Wallet, WalletTransaction, Transfer, DateTime
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from app.schemas.auth import OTPRequest, OTPVerifyRequest, RegistrationStartRequest, RegistrationPhoneVerifyRequest, RegistrationDetailsRequest, RegistrationEmailVerifyRequest, LoginRequest, LoginVerifyRequest
+from app.schemas.auth import OTPRequest, OTPVerifyRequest, RegistrationStartRequest, RegistrationPhoneVerifyRequest, RegistrationDetailsRequest, RegistrationEmailVerifyRequest, LoginRequest, LoginVerifyRequest, SetMPINRequest
 from app.services.otp_service import generate_otp, hash_otp, verify_otp
 from app.services.registration_service import generate_registration_token
 from app.services.auth_service import create_access_token, decode_access_token
+from app.services.mpin_service import hash_mpin, verify_mpin
 
 app = FastAPI(title="PayAI")
 security = HTTPBearer()
@@ -74,9 +75,13 @@ class WithdrawRequest(BaseModel):
     amount: Decimal = Field(gt=0)
 
 class TransferRequest(BaseModel):
-    sender_user_id: int
     receiver_user_id: int
     amount: Decimal = Field(gt=0)
+    mpin: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$"
+    )
 
 @app.get("/")
 def root():
@@ -719,6 +724,49 @@ def get_me(
         "phone_verified": current_user.phone_verified,
     }
 
+@app.post("/auth/mpin/set")
+def set_mpin(
+    request: SetMPINRequest,
+    current_user: User = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        # 1. Confirm both MPIN values match
+        if request.mpin != request.confirm_mpin:
+            raise HTTPException(
+                status_code=400,
+                detail="MPINs do not match"
+            )
+
+        # 2. Prevent overwriting an existing MPIN
+        if current_user.mpin_hash is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="MPIN is already set"
+            )
+
+        # 3. Hash the MPIN
+        current_user.mpin_hash = hash_mpin(request.mpin)
+
+        # 4. Save the hash
+        db.add(current_user)
+        db.commit()
+
+        return {
+            "message": "MPIN set successfully"
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
 
 @app.post("/users")
 def create_user(user: UserCreate):
@@ -1117,29 +1165,41 @@ def get_wallet_transactions(
 @app.post("/transfers")
 def create_transfer(
     transfer_request: TransferRequest,
-    idempotency_key: str = Header(...)
+    idempotency_key: str = Header(...),
+    current_user: User = Depends(get_current_user),
 ):
     db = SessionLocal()
 
     try:
 
-        # 1. Sender and receiver cannot be the same user
-        if transfer_request.sender_user_id == transfer_request.receiver_user_id:
+        # 1. Sender comes from the authenticated JWT
+        sender = current_user
+
+        # 2. Verify MPIN for transaction authorization
+        if sender.mpin_hash is None:
+            raise HTTPException(
+                status_code=400,
+                detail="MPIN is not set"
+            )
+
+        if not verify_mpin(
+            transfer_request.mpin,
+            sender.mpin_hash
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid MPIN"
+            )
+
+
+        #2. Sender and receiver cannot be the same user
+        if sender.id == transfer_request.receiver_user_id:
             raise HTTPException(
                 status_code=400,
                 detail="Sender and receiver cannot be the same user"
             )
 
-        # 2. Find sender
-        sender = db.get(User, transfer_request.sender_user_id)
-
-        if sender is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Sender user not found"
-            )
-
-        # 3. Find receiver
+        #3. Find receiver
         receiver = db.get(User, transfer_request.receiver_user_id)
 
         if receiver is None:
@@ -1158,14 +1218,6 @@ def create_transfer(
         if existing_transfer is not None:
 
             # Find wallets belonging to the original transfer
-            if (
-                existing_transfer.sender_wallet_id
-                != db.get(Wallet, existing_transfer.sender_wallet_id).id
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid existing transfer"
-                )
 
             original_sender_wallet = db.get(
                 Wallet,

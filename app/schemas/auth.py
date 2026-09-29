@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class OTPRequest(BaseModel):
@@ -37,3 +37,16 @@ class LoginVerifyRequest(BaseModel):
     identifier: str
     channel: str
     otp: str
+
+class SetMPINRequest(BaseModel):
+    mpin: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$"
+    )
+
+    confirm_mpin: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$"
+    )
