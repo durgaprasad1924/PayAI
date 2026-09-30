@@ -16,6 +16,8 @@ class User(Base):
     phone = Column(String(20),unique=True,nullable=True)
     phone_verified = Column(Boolean,nullable=False,default=False)
     mpin_hash = Column(String(255), nullable=True)
+    mpin_failed_attempts = Column(Integer, nullable=False, default=0)
+    mpin_locked_until = Column(DateTime(timezone=True), nullable=True)
 
 class Wallet(Base):
     __tablename__ = "wallets"
@@ -78,4 +80,18 @@ class RegistrationChallenge(Base):
         default=lambda: datetime.now(timezone.utc)
     )
 
-    
+class Device(Base):
+    __tablename__ = "devices"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    device_id = Column(String(255), unique=True, nullable=False)
+    device_name = Column(String(100), nullable=True)
+    platform = Column(String(20), nullable=False)
+    status = Column(String(20), nullable=False, default="ACTIVE")
+    registered_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc)
+    )
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)

@@ -6,14 +6,14 @@ from decimal import Decimal
 from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
-from app.models import RegistrationChallenge, User, OTPVerification, Wallet, WalletTransaction, Transfer, DateTime
+from app.models import RegistrationChallenge, User, OTPVerification, Wallet, WalletTransaction, Transfer, Device
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from app.schemas.auth import OTPRequest, OTPVerifyRequest, RegistrationStartRequest, RegistrationPhoneVerifyRequest, RegistrationDetailsRequest, RegistrationEmailVerifyRequest, LoginRequest, LoginVerifyRequest, SetMPINRequest
+from app.schemas.auth import OTPRequest, OTPVerifyRequest, RegistrationStartRequest, RegistrationPhoneVerifyRequest, RegistrationDetailsRequest, RegistrationEmailVerifyRequest, LoginRequest, LoginVerifyRequest, SetMPINRequest, DeviceRegisterRequest, MPINLoginRequest
 from app.services.otp_service import generate_otp, hash_otp, verify_otp
 from app.services.registration_service import generate_registration_token
 from app.services.auth_service import create_access_token, decode_access_token
-from app.services.mpin_service import hash_mpin, verify_mpin
+from app.services.mpin_service import hash_mpin, verify_mpin, is_mpin_locked, get_mpin_lock_expiry, MAX_MPIN_FAILED_ATTEMPTS
 
 app = FastAPI(title="PayAI")
 security = HTTPBearer()
@@ -667,62 +667,85 @@ def verify_login(request: LoginVerifyRequest):
     finally:
         db.close()
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-):
-    db = SessionLocal()
-
-    try:
-        token = credentials.credentials
-
-        try:
-            payload = decode_access_token(token)
-        except jwt.InvalidTokenError:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid or expired access token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        user_id = payload.get("sub")
-
-        if not user_id:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid access token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        user = (
-            db.query(User)
-            .filter(User.id == int(user_id))
-            .first()
-        )
-
-        if not user:
-            raise HTTPException(
-                status_code=401,
-                detail="User not found",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        return user
-
-    finally:
-        db.close()
-
 @app.get("/auth/me")
 def get_me(
     current_user: User = Depends(get_current_user),
 ):
-    return {
-        "id": current_user.id,
-        "name": current_user.name,
-        "email": current_user.email,
-        "phone": current_user.phone,
-        "email_verified": current_user.email_verified,
-        "phone_verified": current_user.phone_verified,
-    }
+    db = SessionLocal()
+
+    try:
+        device = (
+            db.query(Device)
+            .filter(
+                Device.user_id == current_user.id,
+                Device.status == "ACTIVE"
+            )
+            .order_by(Device.registered_at.desc())
+            .first()
+        )
+
+        return {
+            "id": current_user.id,
+            "name": current_user.name,
+            "email": current_user.email,
+            "phone": current_user.phone,
+            "email_verified": current_user.email_verified,
+            "phone_verified": current_user.phone_verified,
+            "device": (
+                {
+                    "device_id": device.device_id,
+                    "device_name": device.device_name,
+                    "platform": device.platform,
+                    "status": device.status,
+                }
+                if device else None
+            ),
+        }
+
+    finally:
+        db.close()
+
+@app.post("/auth/device/register")
+def register_device(
+    request: DeviceRegisterRequest,
+    current_user: User = Depends(get_current_user),
+):
+    db = SessionLocal()
+
+    try:
+        existing_device = (
+            db.query(Device)
+            .filter(Device.device_id == request.device_id)
+            .first()
+        )
+
+        if existing_device:
+            raise HTTPException(
+                status_code=409,
+                detail="Device is already registered"
+            )
+
+        device = Device(
+            user_id=current_user.id,
+            device_id=request.device_id,
+            device_name=request.device_name,
+            platform=request.platform,
+            status="ACTIVE",
+            registered_at=datetime.now(timezone.utc),
+        )
+
+        db.add(device)
+        db.commit()
+        db.refresh(device)
+
+        return {
+            "message": "Device registered successfully",
+            "device_id": device.device_id,
+            "status": device.status,
+        }
+
+    finally:
+        db.close()
 
 @app.post("/auth/mpin/set")
 def set_mpin(
@@ -732,6 +755,24 @@ def set_mpin(
     db = SessionLocal()
 
     try:
+
+        # 1. Check that the user has an active registered device
+        device = (
+            db.query(Device)
+            .filter(
+                Device.user_id == current_user.id,
+                Device.status == "ACTIVE"
+            )
+            .order_by(Device.registered_at.desc())
+            .first()
+        )
+
+        if not device:
+            raise HTTPException(
+                status_code=400,
+                detail="No active registered device found"
+            )
+
         # 1. Confirm both MPIN values match
         if request.mpin != request.confirm_mpin:
             raise HTTPException(
@@ -764,6 +805,102 @@ def set_mpin(
     except Exception:
         db.rollback()
         raise
+
+    finally:
+        db.close()
+
+@app.post("/auth/login/mpin")
+def login_with_mpin(request: MPINLoginRequest):
+    db = SessionLocal()
+
+    try:
+        # 1. Find the registered device
+        device = (
+            db.query(Device)
+            .filter(Device.device_id == request.device_id)
+            .first()
+        )
+
+        if not device:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid device or MPIN"
+            )
+
+        # 2. Check device status
+        if device.status != "ACTIVE":
+            raise HTTPException(
+                status_code=401,
+                detail="Device is not active"
+            )
+
+        # 3. Find the user associated with the device
+        user = (
+            db.query(User)
+            .filter(User.id == device.user_id)
+            .first()
+        )
+
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid device or MPIN"
+            )
+
+        # 4. Make sure MPIN has been set
+        if user.mpin_hash is None:
+            raise HTTPException(
+                status_code=400,
+                detail="MPIN is not set"
+            )
+
+        # 5. Check MPIN lock
+        if is_mpin_locked(user.mpin_locked_until):
+            raise HTTPException(
+                status_code=423,
+                detail="MPIN is temporarily locked"
+            )
+
+        # 6. Verify MPIN
+        if not verify_mpin(request.mpin, user.mpin_hash):
+
+            user.mpin_failed_attempts += 1
+
+            if user.mpin_failed_attempts >= MAX_MPIN_FAILED_ATTEMPTS:
+                user.mpin_locked_until = get_mpin_lock_expiry()
+                user.mpin_failed_attempts = 0
+
+                db.commit()
+
+                raise HTTPException(
+                    status_code=423,
+                    detail="MPIN is temporarily locked"
+                )
+
+            db.commit()
+
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid device or MPIN"
+            )
+
+        # 7. Successful MPIN authentication
+        user.mpin_failed_attempts = 0
+        user.mpin_locked_until = None
+
+        # 8. Update device last seen
+        device.last_seen_at = datetime.now(timezone.utc)
+
+        # 9. Save authentication state
+        db.commit()
+
+        # 10. Create final access token
+        access_token = create_access_token(user.id)
+
+        return {
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
 
     finally:
         db.close()
@@ -1173,7 +1310,18 @@ def create_transfer(
     try:
 
         # 1. Sender comes from the authenticated JWT
-        sender = current_user
+        sender = (
+            db.query(User)
+            .filter(User.id == current_user.id)
+            .with_for_update()
+            .one_or_none()
+        )
+
+        if sender is None:
+            raise HTTPException(
+                status_code=401,
+                detail="User not found"
+            )
 
         # 2. Verify MPIN for transaction authorization
         if sender.mpin_hash is None:
@@ -1182,15 +1330,40 @@ def create_transfer(
                 detail="MPIN is not set"
             )
 
+        # 3. Check whether MPIN is currently locked
+        if is_mpin_locked(sender.mpin_locked_until):
+            raise HTTPException(
+                status_code=401,
+                detail="MPIN is temporarily locked. Please try again later."
+            )
+
+        # 4. Verify MPIN
         if not verify_mpin(
             transfer_request.mpin,
             sender.mpin_hash
         ):
+            sender.mpin_failed_attempts += 1
+
+            # Lock the MPIN after the maximum number of failures
+            if sender.mpin_failed_attempts >= MAX_MPIN_FAILED_ATTEMPTS:
+                sender.mpin_locked_until = get_mpin_lock_expiry()
+
+            db.commit()
+
+            if sender.mpin_locked_until is not None:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Too many failed MPIN attempts. MPIN is locked for 15 minutes."
+                )
+
             raise HTTPException(
                 status_code=401,
                 detail="Invalid MPIN"
             )
 
+        # 5. Successful MPIN verification resets the failure counter
+        sender.mpin_failed_attempts = 0
+        sender.mpin_locked_until = None
 
         #2. Sender and receiver cannot be the same user
         if sender.id == transfer_request.receiver_user_id:
@@ -1198,7 +1371,6 @@ def create_transfer(
                 status_code=400,
                 detail="Sender and receiver cannot be the same user"
             )
-
         #3. Find receiver
         receiver = db.get(User, transfer_request.receiver_user_id)
 

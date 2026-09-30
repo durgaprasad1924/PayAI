@@ -50,3 +50,16 @@ class SetMPINRequest(BaseModel):
         max_length=6,
         pattern=r"^\d{6}$"
     )
+
+class DeviceRegisterRequest(BaseModel):
+    device_id: str
+    device_name: str | None = None
+    platform: str
+
+class MPINLoginRequest(BaseModel):
+    device_id: str
+    mpin: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$"
+    )
