@@ -12,8 +12,7 @@ JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(
     os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "30")
 )
 
-
-def create_access_token(user_id: int) -> str:
+def create_access_token(user_id: int,session_id: str,) -> str:
     now = datetime.now(timezone.utc)
 
     expires_at = now + timedelta(
@@ -22,6 +21,7 @@ def create_access_token(user_id: int) -> str:
 
     payload = {
         "sub": str(user_id),
+        "session_id": session_id,
         "iat": now,
         "exp": expires_at,
     }

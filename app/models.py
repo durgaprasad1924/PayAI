@@ -95,3 +95,25 @@ class Device(Base):
         default=lambda: datetime.now(timezone.utc)
     )
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
+
+class MPINResetChallenge(Base):
+    __tablename__ = "mpin_reset_challenges"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reset_token = Column(String(255), unique=True, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False,default=lambda: datetime.now(timezone.utc))   
+
+class Session(Base):
+    __tablename__ = "sessions"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer,ForeignKey("users.id"),nullable=False)
+    device_id = Column(Integer,ForeignKey("devices.id"),nullable=False)
+    session_id = Column(String(255),unique=True,nullable=False)
+    created_at = Column(DateTime(timezone=True),nullable=False,default=lambda: datetime.now(timezone.utc))
+    expires_at = Column(DateTime(timezone=True),nullable=False)
+    revoked_at = Column(DateTime(timezone=True),nullable=True)
+    last_seen_at = Column(DateTime(timezone=True),nullable=True)
